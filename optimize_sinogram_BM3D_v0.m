@@ -1,33 +1,47 @@
-% CT Sinogram Fusion using ADMM with Grid Search
+%% CT Sinogram Fusion using PnP-ADMM (BM3D) with Grid Search
+% 
+% Optimization Problem (Plug-and-Play ADMM):
+% This code performs Sinogram-domain fusion by solving:
+%
+% min_{s}  1/2 * ||P_S * s - s_S||_2^2 + alpha/2 * ||P_A * s - s_A||_2^2 + eta * Phi(s)
+%
+% Where:
+% s: The fused target sinogram (vectorized)
+% P_S: Spatial subsampling/blurring operator
+% P_A: Angular masking operator
+% Phi(s): Implicit regularizer replaced by the BM3D denoiser (Plug-and-Play)
+% alpha: Weighting factor between the spatial and angular data fidelity
+% eta: Regularization parameter (linked to denoiser strength)
+% mu: ADMM penalty parameter (augmented Lagrangian parameter)
+
 clear; clc; close all;
 addpath('bm3d_matlab_package_4.0.3\bm3d');
 
-%% 1. 參數設定與資料生成
+%% 1. Parameter Settings and Data Generation
 img_size = 256;     
 theta = 0:1:179;    
 
-% --- radon 轉換設定 ---
-filter = 'Ram-Lak'; % "Ram-Lak" (default) | "Shepp-Logan" | "Cosine" | "Hamming" | "Hann" | "None"
+% --- Radon Transform Settings ---
+filter = 'Ram-Lak'; % Reconstruction filter
 
-% --- Grid Search 範圍設定 ---
-eta_list = [0.001, 0.005, 0.01, 0.05, 0.1, 0.5]; % 測試不同的 eta (gamma)
-mu_list  = [0.1, 0.5, 1, 5];       % 測試不同的 mu
-alpha_list = [0.01, 0.1, 1];
-max_iter = 30;                     % 為了搜索效率，迭代次數不宜設過大
+% --- Grid Search Range Settings ---
+eta_list = [0.001, 0.005, 0.01, 0.05, 0.1, 0.5]; % Regularization weight
+mu_list  = [0.1, 0.5, 1, 5];                     % ADMM step size / penalty
+alpha_list = [0.01, 0.1, 1];                     % Weight for angular observation
+max_iter = 30;                                   % Iterations (kept low for search speed)
 
-% --- 求解反矩陣設定 ---
+% --- Linear Solver (PCG) Settings ---
 pcg_tol = 1e-6;
 pcg_maxIt = 50;
 
-
-% 生成 s_true (Vectorized Sinogram)
+% Generate Ground Truth Sinogram
 X_true = phantom(img_size);
 sinogram_true = radon(X_true, theta);
 [M, N] = size(sinogram_true);
 s_true = sinogram_true(:); 
 mn = length(s_true);
 
-% 2.1 構造 P_S_sub (空間模糊)
+% 2.1 Construct P_S_sub (Spatial Blurring/Averaging Operator)
 K = 2; 
 P_S_sub = sparse(M, M);
 for i = 1:K:M
@@ -35,23 +49,23 @@ for i = 1:K:M
     P_S_sub(idx, idx) = 1/length(idx);
 end
 
-% 2.2 構造 P_A (角度遮罩)
+% 2.2 Construct P_A (Angular Mask)
 mask_A = zeros(M, N);
-mask_A(:, 1:2:end) = 1;
+mask_A(:, 1:2:end) = 1; % Subsample angles by half
 P_A_vec = sparse(mask_A(:)); 
 
-% 2.3 生成觀測值 s_S, s_A
+% 2.3 Generate Observations s_S and s_A
 s_S_mat = P_S_sub * sinogram_true; 
 s_S = s_S_mat(:);
 s_A = P_A_vec .* s_true;
 
-% 2.4 算子定義
+% 2.4 Operator Definition
 [D, ~] = forward_diff_operators(M, N); 
 
-%% 2. Grid Search 執行
-results = []; % 用於儲存結果的表格
+%% 2. Grid Search Execution
+results = []; % Table to store performance metrics
 
-fprintf('開始 Grid Search...\n');
+fprintf('Starting Grid Search...\n');
 fprintf('%-10s %-10s %-10s %-10s %-10s %-10s\n', 'eta', 'mu', 'alpha', 'RMSE', 'PSNR', 'SSIM');
 
 for e_idx = 1:length(eta_list)
@@ -61,113 +75,100 @@ for e_idx = 1:length(eta_list)
             mu = mu_list(m_idx);
             alpha = alpha_list(a_idx);
 
-            % --- ADMM 核心邏輯 ---
-            s_k = zeros(mn, 1);  % 統一使用 s_k
-            z_k = zeros(mn, 1);  % 新增：初始化 z_k (解決你的報錯)
-            u_k = zeros(mn, 1);  % 修正：PnP-ADMM 中 u_k 的長度應與 s_k 一致 (mn 而非 2*mn)
-
+            % --- ADMM Initialization ---
+            s_k = zeros(mn, 1);  
+            z_k = zeros(mn, 1);  
+            u_k = zeros(mn, 1);  
             A_op = @(x) apply_LHS(x, P_S_sub, P_A_vec, mu, alpha, M, N);
 
             for k = 1:max_iter
-                % --- Step 1: s-update (Data Fidelity) ---
+                % --- Step 1: s-update (Least Squares Data Fidelity) ---
+                % Solves: (P_S'P_S + alpha*P_A'P_A + mu*I)s = P_S's_S + alpha*P_A's_A + mu(z-u)
                 s_S_mat_in = reshape(s_S, [M, N]);
-                term1 = P_S_sub * s_S_mat_in;
+                term1 = P_S_sub' * s_S_mat_in; % P_S' * s_S
                 RHS = term1(:) + alpha * s_A + mu * (z_k - u_k);
                 [s_k, ~] = pcg(A_op, RHS, pcg_tol, pcg_maxIt, [], [], s_k);
 
-                % --- Step 2: z-update (Plug-and-Play BM3D) ---
+                % --- Step 2: z-update (Plug-and-Play BM3D Denoiser) ---
                 sigma_denoise = sqrt(eta / mu);
                 v_k = reshape(s_k + u_k, [M, N]);
-
-                % 呼叫 BM3D
+                % Apply BM3D as the proximal operator
                 z_mat = BM3D(v_k, sigma_denoise);
                 z_k = z_mat(:);
 
-                % --- Step 3: u-update (Dual Update) ---
-                % 修正：PnP-ADMM 不需要微分算子 D，直接使用 (s_k - z_k)
+                % --- Step 3: u-update (Dual Variable Update) ---
                 u_k = u_k + (s_k - z_k);
             end
 
-            % --- Remixing 與 影像重建 ---
+            % --- Sinogram Remixing and Final Reconstruction ---
             S_final = reshape(s_k, [M, N]);
             S_remix = S_final;
+            % Replace reconstructed values with known measurements where available
             S_remix(mask_A == 1) = sinogram_true(mask_A == 1);
-
             img_remix = iradon(S_remix, theta, 'linear', filter, 1, img_size);
 
-            % --- 計算指標 ---
+            % --- Calculate Metrics ---
             curr_rmse = sqrt(mean((X_true(:) - img_remix(:)).^2));
             curr_psnr = psnr(img_remix, X_true);
             curr_ssim = ssim(img_remix, X_true);
 
-            % 紀錄結果
+            % Record results
             results = [results; eta, mu, alpha, curr_rmse, curr_psnr, curr_ssim];
             fprintf('%-10.3f %-10.3f %-10.3f %-10.4f %-10.2f %-10.4f\n', eta, mu, alpha, curr_rmse, curr_psnr, curr_ssim);
         end
     end
 end
 
-%% 3. 找出最佳結果
+%% 3. Identify Best Parameters
 [max_psnr, best_idx] = max(results(:, 5));
 best_eta    = results(best_idx, 1);
 best_mu     = results(best_idx, 2);
 best_alpha  = results(best_idx, 3);
 
-fprintf('\nGrid Search 結束！\n');
-fprintf('最佳參數組合: eta = %.3f, mu = %.3f\n, alpha = %.3f\n', best_eta, best_mu, best_alpha);
-fprintf('最佳 PSNR: %.2f dB\n', max_psnr);
+fprintf('\nGrid Search Finished!\n');
+fprintf('Best Parameters: eta = %.3f, mu = %.3f, alpha = %.3f\n', best_eta, best_mu, best_alpha);
+fprintf('Best PSNR: %.2f dB\n', max_psnr);
 
-%% 4. (選做) 以最佳參數重新跑一次並顯示圖片
-fprintf('\n正在以最佳參數 (eta=%.3f, mu=%.3f, alpha=%.3f) 進行最終重建...\n', best_eta, best_mu, best_alpha);
+%% 4. Final Reconstruction with Optimal Parameters
+fprintf('\nRunning final reconstruction with optimal parameters...\n');
 
-% 使用最佳參數重新初始化變數
-s_k = zeros(mn, 1);  % 統一使用 s_k
-z_k = zeros(mn, 1);  % 新增：初始化 z_k (解決你的報錯)
-u_k = zeros(mn, 1);  % 修正：PnP-ADMM 中 u_k 的長度應與 s_k 一致 (mn 而非 2*mn)
-
+s_k = zeros(mn, 1);
+z_k = zeros(mn, 1);
+u_k = zeros(mn, 1);
 A_op_best = @(x) apply_LHS(x, P_S_sub, P_A_vec, best_mu, best_alpha, M, N);
 
 for k = 1:max_iter
-    % --- Step 1: s-update (Data Fidelity) ---
     s_S_mat_in = reshape(s_S, [M, N]);
-    term1 = P_S_sub * s_S_mat_in;
+    term1 = P_S_sub' * s_S_mat_in;
     RHS = term1(:) + best_alpha * s_A + best_mu * (z_k - u_k);
     [s_k, ~] = pcg(A_op_best, RHS, pcg_tol, pcg_maxIt, [], [], s_k);
-
-    % --- Step 2: z-update (Plug-and-Play BM3D) ---
+    
     sigma_denoise = sqrt(best_eta / best_mu);
     v_k = reshape(s_k + u_k, [M, N]);
-
-    % 呼叫 BM3D
-    z_mat = BM3D(v_k, sigma_denoise); %imdiffusefilt(v_k, 'Connectivity', 'maximal', 'GradientThreshold', sigma_denoise);
+    z_mat = BM3D(v_k, sigma_denoise);
     z_k = z_mat(:);
-
-    % --- Step 3: u-update (Dual Update) ---
-    % 修正：PnP-ADMM 不需要微分算子 D，直接使用 (s_k - z_k)
+    
     u_k = u_k + (s_k - z_k);
 end
 
-% 生成最終結果
+% Result Generation
 S_final = reshape(s_k, [M, N]);
 S_remix = S_final;
 S_remix(mask_A == 1) = sinogram_true(mask_A == 1);
 
-% 轉回影像空間
+% Back-projection to Image Domain
 img_final = iradon(S_final, theta, 'linear', filter, 1, img_size);
 img_remix = iradon(S_remix, theta, 'linear', filter, 1, img_size);
 
 m_final = struct('PSNR', psnr(img_final, X_true), 'SSIM', ssim(img_final, X_true));
 m_remix = struct('PSNR', psnr(img_remix, X_true), 'SSIM', ssim(img_remix, X_true));
 
-% --- 繪圖部分 ---
-
-% Figure 1: Sinogram 比較
+% --- Plotting Results ---
 figure('Name', 'Best Parameters: Sinogram Domain');
 subplot(1,3,1); imshow(sinogram_true, []); title('Original Sinogram');
 subplot(1,3,2); imshow(S_final, []); title('Final Sinogram');
 subplot(1,3,3); imshow(S_remix, []); title('Remix Sinogram');
 
-% Figure 2: 影像空間比較
 figure('Name', 'Best Parameters: Image Domain');
 subplot(1,3,1); imshow(X_true, []); title('Original Image');
 subplot(1,3,2); imshow(img_final, []); 
@@ -175,27 +176,18 @@ title(sprintf('Final (PSNR: %.2f dB)', m_final.PSNR));
 subplot(1,3,3); imshow(img_remix, []); 
 title(sprintf('Remix (PSNR: %.2f dB)', m_remix.PSNR));
 
-% Figure 3: Grid Search 性能趨勢 (可選)
-% if size(results, 1) > 1
-%     figure('Name', 'Grid Search PSNR Heatmap');
-%     % 將結果轉為矩陣形式以繪製熱圖
-%     psnr_grid = reshape(results(:, 5), length(mu_list), length(eta_list));
-%     imagesc(eta_list, mu_list, psnr_grid);
-%     colorbar;
-%     xlabel('\eta (eta)'); ylabel('\mu (mu)');
-%     title('PSNR Distribution');
-%     set(gca, 'XScale', 'log', 'YScale', 'log'); % 若參數跨度大建議開啟對數座標
-% end
+%% --- Helper Functions ---
 
-%% --- 輔助函數 ---
+% Function to apply the Left-Hand Side (LHS) operator
 function y = apply_LHS(x_vec, P_S_sub, P_A_vec, mu, alpha, M, N)
     X = reshape(x_vec, [M, N]);
-    PsPsX = P_S_sub * (P_S_sub * X);
-    alphaPaPaX = alpha * (P_A_vec.^2) .* x_vec;
-    % PnP 版本只需加 mu * x_vec
+    % Mathematically: (P_S' * P_S + alpha * P_A' * P_A + mu * I) * x
+    PsPsX = P_S_sub' * (P_S_sub * X); 
+    alphaPaPaX = alpha * (P_A_vec.^2) .* x_vec; % P_A is a diagonal mask, so P_A'P_A is P_A.^2
     y = PsPsX(:) + alphaPaPaX + mu * x_vec;
 end
 
+% Function to create forward difference operators (Standard TV)
 function [D, D_t] = forward_diff_operators(M, N)
     e = ones(M*N, 1);
     Dx = spdiags([-e e], [0 M], M*N, M*N);

@@ -1,19 +1,23 @@
-%% CT Sinogram Fusion using ADMM with Hybrid TGV & Image-Space BM3D
+%% CT Sinogram Fusion using ADMM with TGV Regularization & Grid Search (Hard Constraint)
 %
 % Optimization Problem:
-% min_{s, v}  1/2 * || s_S - P_S * s ||^2_F + 1/2 * || s_A - P_A * s ||^2_F + TGV_{gamma}(s)
-% Refinement: s_{k+1} = (1 - tau) * s_{k+1} + tau * Radon(BM3D(IRadon(s_{k+1})))
+% min_{s, v}  1/2 * || s_S - P_S * s ||^2_F + gamma1 * || D*s - v ||_1 + gamma0 * || E*v ||_1
+% subject to: P_A * s = s_A
 %
 % Where:
 % s:     The target sinogram to be reconstructed (vectorized).
+% v:     An auxiliary variable approximating the first-order derivative of s.
 % P_S:   Spatial blurring/subsampling operator.
-% P_A:   Angular sampling mask.
-% TGV:   Total Generalized Variation (1st and 2nd order smoothness in sinogram space).
-% BM3D:  Plug-and-Play denoiser applied in the Image domain for structural refinement.
-% tau:   Relaxation/Mixing parameter for the Image-space denoiser update.
+% P_A:   Angular sampling mask (diagonal operator).
+% s_S:   Observed spatially blurred sinogram.
+% s_A:   Observed sharp sinogram samples at specific angles (Hard Constraint).
+% D:     First-order forward difference operator.
+% E:     Symmetrized derivative operator.
+% gamma: Regularization parameters for TGV.
+%
+% This formulation uses a "Hard Constraint" via projection: s_k(sampled) = s_A.
 
 clear; clc; close all;
-addpath('bm3d_matlab_package_4.0.3\bm3d');
 
 %% 1. Parameter Settings and Data Generation
 img_size = 256;     
@@ -25,9 +29,7 @@ gamma0_list = [0.01, 0.1];
 gamma1_list = [0.01, 0.1];
 mu0_list    = [0.1, 0.5];     
 mu1_list    = [0.1, 0.5];     
-alpha_list  = [0.1, 1];      
-tau = 0.025;                % Mixing factor for Image-space BM3D refinement
-max_iter    = 50;           % Iterations for Grid Search
+max_iter    = 50;           % Iterations per search configuration
 pcg_tol = 1e-6;
 pcg_maxIt = 50;
 
@@ -48,7 +50,7 @@ end
 
 % 2.2 Construct P_A (Angular Mask)
 mask_A = zeros(M, N);
-mask_A(:, 1:2:end) = 1; % Subsample angles
+mask_A(:, 1:2:end) = 1; % Sparse sampling
 P_A_vec = sparse(mask_A(:)); 
 
 % 2.3 Generate Observations
@@ -56,27 +58,26 @@ s_S_mat = P_S_sub * sinogram_true;
 s_S = s_S_mat(:);
 s_A = P_A_vec .* s_true;
 
-% 2.4 Operator Initialization
+% 2.4 Initialize Difference Operators
 [Dx, Dy] = get_diff_ops(M, N);
 D = [Dx; Dy]; 
 
 %% 2. Grid Search Execution
 results = [];
-total_configs = length(gamma0_list) * length(gamma1_list) * length(mu0_list) * length(mu1_list) * length(alpha_list);
+total_configs = length(gamma0_list) * length(gamma1_list) * length(mu0_list) * length(mu1_list);
 count = 0;
 best_psnr = -inf;
 best_params = [];
 
-fprintf('Starting Grid Search (Hybrid TGV-BM3D), %d configs...\n', total_configs);
+fprintf('Starting Grid Search (TGV Hard Constraint), %d configurations...\n', total_configs);
 
 for g0 = gamma0_list
     for g1 = gamma1_list
         for m0 = mu0_list
             for m1 = mu1_list
-                for al = alpha_list
                     count = count + 1;
                     
-                    % Variables Initialization
+                    % Variable Initialization
                     s_k = zeros(mn, 1);
                     v_k = zeros(2*mn, 1);
                     z1_k = zeros(2*mn, 1);
@@ -84,75 +85,70 @@ for g0 = gamma0_list
                     u1_k = zeros(2*mn, 1);
                     u2_k = zeros(3*mn, 1);
 
-                    % Current configuration operators
-                    A_s_op = @(s) apply_LHS_s(s, P_S_sub, P_A_vec, D, m0, al, M, N);
+                    % Operators for current configuration
+                    A_s_op = @(s) apply_LHS_s(s, P_S_sub, D, m0, M, N);
                     A_v_op = @(v) apply_LHS_v(v, Dx, Dy, m0, m1, M, N);
 
+                    % ADMM Iterations
                     for k = 1:max_iter
-                        % --- Step 1: z-update (TGV Shrinkage) ---
+                        % z-update (Soft Thresholding)
                         tmp1 = D*s_k - v_k + u1_k;
                         z1_k = sign(tmp1) .* max(abs(tmp1) - g0/m0, 0);
+                        
                         Ev_k = apply_E(v_k, Dx, Dy, M, N);
                         tmp2 = Ev_k + u2_k;
                         z2_k = sign(tmp2) .* max(abs(tmp2) - g1/m1, 0);
-
-                        % --- Step 2: s-update (Sinogram-space Data Fidelity) ---
+                        
+                        % s-update (Least Squares via PCG)
                         s_S_mat_in = reshape(s_S, [M, N]);
-                        term1 = P_S_sub' * s_S_mat_in; % Adjoint of spatial blur
-                        RHS_s = term1(:) + al * s_A + m0 * D' * (z1_k + v_k - u1_k);
+                        term1 = P_S_sub' * s_S_mat_in; 
+                        RHS_s = term1(:) + m0 * D' * (z1_k + v_k - u1_k);
                         [s_k, ~] = pcg(A_s_op, RHS_s, pcg_tol, pcg_maxIt, [], [], s_k);
+                        
+                        % Hard Constraint Projection: s_sampled = s_observed
+                        s_k(P_A_vec == 1) = s_A(P_A_vec == 1); 
 
-                        % --- Step 3: Hybrid Image-space Refinement (PnP-BM3D) ---
-                        sigma_bm3d = sqrt(g0/m0);
-                        temp_x = iradon(full(reshape(s_k, [M, N])), theta, 'linear', filter, 1, img_size);
-                        bm3d_x = BM3D(temp_x, sigma_bm3d);
-                        s_bm3d = radon(bm3d_x, theta);
-                        % Relaxed update combining Sinogram solution and Image refinement
-                        s_k = (1 - tau) * s_k + tau * s_bm3d(:);
-
-                        % --- Step 4: v-update (TGV auxiliary variable) ---
+                        % v-update (Least Squares via PCG)
                         Et_term = apply_Et(z2_k - u2_k, Dx, Dy, M, N);
                         RHS_v = m0 * (D*s_k - z1_k + u1_k) + m1 * Et_term;
                         [v_k, ~] = pcg(A_v_op, RHS_v, pcg_tol, pcg_maxIt, [], [], v_k);
 
-                        % --- Step 5: u-update (Dual variables) ---
+                        % u-update (Dual variables)
                         u1_k = u1_k + (D*s_k - v_k - z1_k);
                         u2_k = u2_k + (apply_E(v_k, Dx, Dy, M, N) - z2_k);
                     end
-
-                    % Metrics calculation for Grid Search selection
-                    s_remix = s_k; 
-                    s_remix(logical(P_A_vec)) = s_true(logical(P_A_vec));
-                    X_remix = iradon(full(reshape(s_remix, [M, N])), theta, 'linear', filter, 1, img_size);
-                    curr_psnr = psnr(X_remix, X_true);
-                    results = [results; g0, g1, m0, m1, al, curr_psnr];
+                    
+                    % Metrics Evaluation
+                    img_recon = iradon(full(reshape(s_k, [M, N])), theta, 'linear', filter, 1, img_size);
+                    curr_psnr = psnr(img_recon, X_true);
+                    results = [results; g0, g1, m0, m1, curr_psnr];
                     
                     if curr_psnr > best_psnr
                         best_psnr = curr_psnr;
-                        best_params = [g0, g1, m0, m1, al];
+                        best_params = [g0, g1, m0, m1];
                     end
                     
-                    fprintf('[%d/%d] g0:%.2f, g1:%.2f, m0:%.1f, m1:%.1f, al:%.2f | Remix Image PSNR: %.4f\n', ...
-                        count, total_configs, g0, g1, m0, m1, al, curr_psnr);
-                end
+                    fprintf('[%d/%d] g0:%.2f, g1:%.2f, m0:%.1f, m1:%.1f | Image PSNR: %.4f\n', ...
+                        count, total_configs, g0, g1, m0, m1, curr_psnr);
             end
         end
     end
 end
 
-%% 3. Final Reconstruction with Best Parameters
+%% 3. Final Reconstruction with Optimal Parameters
 bg0 = best_params(1); bg1 = best_params(2); 
-bm0 = best_params(3); bm1 = best_params(4); bal = best_params(5);
-fprintf('\nFinal Reconstruction (g0=%.2f, g1=%.2f, m0=%.1f, m1=%.1f, al=%d)...\n', bg0, bg1, bm0, bm1, bal);
+bm0 = best_params(3); bm1 = best_params(4);
+
+fprintf('\nFinal reconstruction (Best Params: g0=%.2f, g1=%.2f, m0=%.1f, m1=%.1f)...\n', bg0, bg1, bm0, bm1);
 
 s_k = zeros(mn, 1); v_k = zeros(2*mn, 1);
 z1_k = zeros(2*mn, 1); z2_k = zeros(3*mn, 1);
 u1_k = zeros(2*mn, 1); u2_k = zeros(3*mn, 1);
 
-A_s_best = @(s) apply_LHS_s(s, P_S_sub, P_A_vec, D, bm0, bal, M, N);
+A_s_best = @(s) apply_LHS_s(s, P_S_sub, D, bm0, M, N);
 A_v_best = @(v) apply_LHS_v(v, Dx, Dy, bm0, bm1, M, N);
 
-for k = 1:max_iter * 2 
+for k = 1:max_iter * 2
     tmp1 = D*s_k - v_k + u1_k;
     z1_k = sign(tmp1) .* max(abs(tmp1) - bg0/bm0, 0);
     tmp2 = apply_E(v_k, Dx, Dy, M, N) + u2_k;
@@ -160,14 +156,11 @@ for k = 1:max_iter * 2
     
     s_S_mat_in = reshape(s_S, [M, N]);
     term1 = P_S_sub' * s_S_mat_in;
-    RHS_s = term1(:) + bal * s_A + bm0 * D' * (z1_k + v_k - u1_k);
+    RHS_s = term1(:) + bm0 * D' * (z1_k + v_k - u1_k);
     [s_k, ~] = pcg(A_s_best, RHS_s, pcg_tol, pcg_maxIt, [], [], s_k);
     
-    sigma_bm3d = sqrt(bg0/bm0);
-    temp_x = iradon(full(reshape(s_k, [M, N])), theta, 'linear', filter, 1, img_size);
-    bm3d_x = BM3D(temp_x, sigma_bm3d);
-    s_bm3d = radon(bm3d_x, theta);
-    s_k = (1 - tau) * s_k + tau * s_bm3d(:);
+    % Apply Hard Constraint
+    s_k(P_A_vec == 1) = s_A(P_A_vec == 1); 
     
     RHS_v = bm0 * (D*s_k - z1_k + u1_k) + bm1 * apply_Et(z2_k - u2_k, Dx, Dy, M, N);
     [v_k, ~] = pcg(A_v_best, RHS_v, pcg_tol, pcg_maxIt, [], [], v_k);
@@ -176,34 +169,21 @@ for k = 1:max_iter * 2
     u2_k = u2_k + (apply_E(v_k, Dx, Dy, M, N) - z2_k);
 end
 
-% --- Generate Remix Result ---
+% Image Space Conversion
 S_final = reshape(s_k, [M, N]);
-X_remix = S_final;
-X_remix(mask_A == 1) = sinogram_true(mask_A == 1); 
-
-% Transform back to Image Space
 img_final = iradon(S_final, theta, 'linear', filter, 1, img_size);
-img_remix = iradon(X_remix, theta, 'linear', filter, 1, img_size);
-
 m_final = eval_metrics(X_true, img_final);
-m_remix = eval_metrics(X_true, img_remix);
 
-fprintf('\nFinal Metric Comparison:\n');
+fprintf('\nFinal Performance Comparison:\n');
 fprintf('Final -> RMSE: %.4f, PSNR: %.2f dB, SSIM: %.4f\n', m_final.RMSE, m_final.PSNR, m_final.SSIM);
-fprintf('Remix -> RMSE: %.4f, PSNR: %.2f dB, SSIM: %.4f\n', m_remix.RMSE, m_remix.PSNR, m_remix.SSIM);
 
-%% 4. Plotting Results
-figure('Name', 'Best Parameters: Sinogram Domain');
-subplot(1,3,1); imshow(sinogram_true, []); title('Original Sinogram');
-subplot(1,3,2); imshow(S_final, []); title('Final (Reconstructed)');
-subplot(1,3,3); imshow(X_remix, []); title('Remix (Fused)');
-
-figure('Name', 'Best Parameters: Image Domain');
-subplot(1,3,1); imshow(X_true, []); title('Ground Truth');
-subplot(1,3,2); imshow(img_final, []); 
-title(sprintf('Final (PSNR: %.2f dB)', m_final.PSNR));
-subplot(1,3,3); imshow(img_remix, []); 
-title(sprintf('Remix (PSNR: %.2f dB)', m_remix.PSNR));
+%% 4. Plotting
+figure('Name', 'TGV V2 Hard Constraint Results');
+subplot(1,4,1); imshow(sinogram_true, []); title('Origin Sinogram');
+subplot(1,4,2); imshow(S_final, []); title('Final Sinogram (Hard Cstr)');
+subplot(1,4,3); imshow(X_true, []); title('Ground Truth Image');
+subplot(1,4,4); imshow(img_final, []); 
+title(sprintf('Recon (PSNR: %.2f dB)', m_final.PSNR));
 
 %% --- Helper Functions ---
 
@@ -213,24 +193,28 @@ function m = eval_metrics(gt, recon)
     m.SSIM = ssim(recon, gt);
 end
 
-function y = apply_LHS_s(s, P_S_sub, P_A_vec, D, mu0, alpha, M, N)
+% LHS for s-update: (P_S' * P_S + mu0 * D' * D)
+function y = apply_LHS_s(s, P_S_sub, D, mu0, M, N)
     S_mat = reshape(s, [M, N]);
-    PsPsS = P_S_sub' * (P_S_sub * S_mat);
-    y = PsPsS(:) + alpha * (P_A_vec.^2 .* s) + mu0 * (D' * (D * s));
+    PsPsS = P_S_sub' * (P_S_sub * S_mat); 
+    y = PsPsS(:) + mu0 * (D' * (D * s));
 end
 
+% LHS for v-update: (mu0 * I + mu1 * E' * E)
 function y = apply_LHS_v(v, Dx, Dy, mu0, mu1, M, N)
     Ev = apply_E(v, Dx, Dy, M, N);
     EtEv = apply_Et(Ev, Dx, Dy, M, N);
     y = mu0 * v + mu1 * EtEv;
 end
 
+% Symmetrized derivative E(v)
 function Ev = apply_E(v, Dx, Dy, M, N)
     MN = M*N;
     vx = v(1:MN); vy = v(MN+1:end);
     Ev = [Dx*vx; Dy*vy; 0.5*(Dy*vx + Dx*vy)];
 end
 
+% Adjoint symmetrized derivative E'(z)
 function Etz = apply_Et(z, Dx, Dy, M, N)
     MN = M*N;
     z11 = z(1:MN); z22 = z(MN+1:2*MN); z12 = z(2*MN+1:end);
@@ -239,6 +223,7 @@ function Etz = apply_Et(z, Dx, Dy, M, N)
     Etz = [vx; vy];
 end
 
+% Forward difference operators
 function [Dx, Dy] = get_diff_ops(M, N)
     e = ones(M*N, 1);
     Dx = spdiags([-e e], [0 1], M*N, M*N); 

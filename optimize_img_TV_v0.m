@@ -1,24 +1,40 @@
-% CT Sinogram Fusion using ADMM with Grid Search
+%% CT Image Fusion using ADMM with Grid Search
+% 
+% Optimization Problem:
+% The code solves a Total Variation (TV) regularized image reconstruction problem:
+% 
+% min_{x}  1/2 * ||x - x_S||_2^2 + alpha/2 * ||x - x_A||_2^2 + eta * ||Dx||_1
+%
+% Where:
+% x: The target image to reconstruct (vectorized)
+% x_S: Reconstruction from spatially blurred sinogram
+% x_A: Reconstruction from angularly masked sinogram
+% D: Forward difference operator (Total Variation)
+% alpha: Weighting factor between the two data fidelity terms
+% eta: Regularization parameter for sparsity/smoothness
+%
+% ADMM formulation uses Mu (µ) as the augmented Lagrangian penalty parameter.
+
 clear; clc; close all;
 
-%% 1. 參數設定與資料生成
+%% 1. Parameter Settings and Data Generation
 img_size = 256;     
 theta = 0:1:179;    
 
-% --- radon 轉換設定 ---
-filter = 'Ram-Lak'; % "Ram-Lak" (default) | "Shepp-Logan" | "Cosine" | "Hamming" | "Hann" | "None"
+% --- Radon Transform Settings ---
+filter = 'Ram-Lak'; % Options: "Ram-Lak", "Shepp-Logan", "Cosine", "Hamming", "Hann", "None"
 
-% --- Grid Search 範圍設定 ---
-eta_list = [0.001, 0.005, 0.01, 0.05, 0.1, 0.5]; % 測試不同的 eta (gamma)
-mu_list  = [0.1, 0.5, 1, 5];       % 測試不同的 mu
-alpha_list = [0.01, 0.1, 1, 10, 100];
-max_iter = 200;                     % 為了搜索效率，迭代次數不宜設過大
+% --- Grid Search Range Settings ---
+eta_list = [0.001, 0.005, 0.01, 0.05, 0.1, 0.5]; % Testing different eta (regularization strength)
+mu_list  = [0.1, 0.5, 1, 5];                      % Testing different mu (ADMM step size/penalty)
+alpha_list = [0.01, 0.1, 1, 10, 100];             % Testing different alpha (data fidelity weight)
+max_iter = 200;                                   % Iterations limited for search efficiency
 
-% --- 求解反矩陣設定 ---
+% --- Linear Solver (PCG) Settings ---
 pcg_tol = 1e-6;
 pcg_maxIt = 100;
 
-% 生成 s_true (Vectorized Sinogram)
+% Generate s_true (Vectorized Sinogram)
 X_true = phantom(img_size);
 sinogram_true = radon(X_true, theta);
 [M, N] = size(sinogram_true);
@@ -26,7 +42,7 @@ s_true = sinogram_true(:);
 x_true = X_true(:);
 mn = length(x_true);
 
-% 2.1 構造 P_S_sub (空間模糊)
+% 2.1 Construct P_S_sub (Spatial Blurring Operator)
 K = 3; 
 P_S_sub = sparse(M, M);
 for i = 1:K:M
@@ -34,31 +50,31 @@ for i = 1:K:M
     P_S_sub(idx, idx) = 1/length(idx);
 end
 
-% 2.2 構造 P_A (角度遮罩)
+% 2.2 Construct P_A (Angular Mask)
 theta_A = 1:5:180;
 mask_A = zeros(M, N);
 mask_A(:, theta_A) = 1;
 P_A_vec = sparse(mask_A(:)); 
 
-% 2.3 生成觀測值 s_S, s_A
+% 2.3 Generate Observed Sinograms: s_S (blurred), s_A (masked)
 s_S_mat = P_S_sub * sinogram_true; 
 s_S = s_S_mat(:);
 s_A = P_A_vec .* s_true;
 s_A_mat = reshape(s_A, [M, N]);
 
-% 2.4 生成觀測值 x_S, x_A
+% 2.4 Generate Preliminary Reconstructions: x_S, x_A
 X_S = iradon(s_S_mat, theta, 'linear', filter, 1, img_size);
 X_A = iradon(full(s_A_mat(:, theta_A)), theta_A, 'linear', filter, 1, img_size);
 x_S = X_S(:);
 x_A = X_A(:);
 
-% 2.5 算子定義
+% 2.5 Define Difference Operators
 [D, ~] = forward_diff_operators(img_size, img_size); 
 
-%% 2. Grid Search 執行
-results = []; % 用於儲存結果的表格
+%% 2. Grid Search Execution
+results = []; % Table to store results
 
-fprintf('開始 Grid Search...\n');
+fprintf('Starting Grid Search...\n');
 fprintf('%-10s %-10s %-10s %-10s %-10s %-10s\n', 'eta', 'mu', 'alpha', 'RMSE', 'PSNR', 'SSIM');
 
 for e_idx = 1:length(eta_list)
@@ -68,55 +84,58 @@ for e_idx = 1:length(eta_list)
             mu = mu_list(m_idx);
             alpha = alpha_list(a_idx);
 
-            % --- ADMM 核心邏輯 ---
+            % --- ADMM Core Logic ---
             x_k = zeros(mn, 1);
             u_k = zeros(2*mn, 1);
             A_op = @(x) apply_LHS(x, D, mu, alpha);
 
             for k = 1:max_iter
+                % Soft-thresholding (z-update)
                 v = D * x_k + u_k;
                 z_k = sign(v) .* max(abs(v) - eta/mu, 0);
 
+                % Linear System Solve (x-update) using Conjugate Gradient
                 RHS = x_S + alpha * x_A + mu * D' * (z_k - u_k);
                 [x_k, ~] = pcg(A_op, RHS, pcg_tol, pcg_maxIt, [], [], x_k);
 
+                % Dual variable update (u-update)
                 u_k = u_k + (D * x_k - z_k);
             end
 
-            % --- 影像重建 ---
+            % --- Reshape Final Image ---
             X_final = reshape(x_k, [img_size, img_size]);
 
-            % --- 計算指標 ---
+            % --- Calculate Metrics ---
             curr_rmse = sqrt(mean((X_true(:) - X_final(:)).^2));
             curr_psnr = psnr(X_final, X_true);
             curr_ssim = ssim(X_final, X_true);
 
-            % 紀錄結果
+            % Record Results
             results = [results; eta, mu, alpha, curr_rmse, curr_psnr, curr_ssim];
             fprintf('%-10.3f %-10.3f %-10.3f %-10.4f %-10.2f %-10.4f\n', eta, mu, alpha, curr_rmse, curr_psnr, curr_ssim);
         end
     end
 end
 
-%% 3. 找出最佳結果
+%% 3. Identify Best Results
 [max_psnr, best_idx] = max(results(:, 5));
 best_eta    = results(best_idx, 1);
 best_mu     = results(best_idx, 2);
 best_alpha  = results(best_idx, 3);
 
-fprintf('\nGrid Search 結束！\n');
-fprintf('最佳參數組合: eta = %.3f, mu = %.3f\n, alpha = %.3f\n', best_eta, best_mu, best_alpha);
-fprintf('最佳 PSNR: %.2f dB\n', max_psnr);
+fprintf('\nGrid Search Finished!\n');
+fprintf('Best Parameters: eta = %.3f, mu = %.3f, alpha = %.3f\n', best_eta, best_mu, best_alpha);
+fprintf('Best PSNR: %.2f dB\n', max_psnr);
 
-%% 4. (選做) 以最佳參數重新跑一次並顯示圖片
-fprintf('\n正在以最佳參數 (eta=%.3f, mu=%.3f, alpha=%.3f) 進行最終重建...\n', best_eta, best_mu, best_alpha);
+%% 4. Final Reconstruction with Best Parameters
+fprintf('\nPerforming final reconstruction with optimal parameters...\n');
 
-% 使用最佳參數重新初始化變數
+% Re-initialize variables with optimal parameters
 x_k = zeros(mn, 1);
 u_k = zeros(2*mn, 1); 
 A_op_best = @(x) apply_LHS(x, D, best_mu, best_alpha);
 
-% 執行最終迭代
+% Final iteration loop
 for k = 1:max_iter
     v = D * x_k + u_k;
     z_k = sign(v) .* max(abs(v) - best_eta/best_mu, 0);
@@ -127,37 +146,27 @@ for k = 1:max_iter
     u_k = u_k + (D * x_k - z_k);
 end
 
-% 生成最終結果
+% Generate final results
 X_final = reshape(x_k, [img_size, img_size]);
-
 m_final = struct('PSNR', psnr(X_final, X_true), 'SSIM', ssim(X_final, X_true));
 
-% --- 繪圖部分 ---
-% Figure 2: 影像空間比較
+% --- Visualization ---
+% Figure 2: Image Domain Comparison
 figure('Name', 'Best Parameters: Image Domain');
 subplot(1,2,1); imshow(X_true, []); title('Original Image');
 subplot(1,2,2); imshow(X_final, []); 
 title(sprintf('Final (PSNR: %.2f dB)', m_final.PSNR));
 
-% Figure 3: Grid Search 性能趨勢 (可選)
-% if size(results, 1) > 1
-%     figure('Name', 'Grid Search PSNR Heatmap');
-%     % 將結果轉為矩陣形式以繪製熱圖
-%     psnr_grid = reshape(results(:, 5), length(mu_list), length(eta_list));
-%     imagesc(eta_list, mu_list, psnr_grid);
-%     colorbar;
-%     xlabel('\eta (eta)'); ylabel('\mu (mu)');
-%     title('PSNR Distribution');
-%     set(gca, 'XScale', 'log', 'YScale', 'log'); % 若參數跨度大建議開啟對數座標
-% end
+%% --- Helper Functions ---
 
-%% --- 輔助函數 ---
+% Function to apply the Left-Hand Side (LHS) operator for the linear system
 function y = apply_LHS(x_vec, D, mu, alpha)
     data_fitting_term = (1+alpha) * x_vec;
     reg_term = mu * (D' * (D * x_vec));
     y = data_fitting_term + reg_term;
 end
 
+% Function to create forward difference operators for Total Variation
 function [D, D_t] = forward_diff_operators(M, N)
     e = ones(M*N, 1);
     Dx = spdiags([-e e], [0 M], M*N, M*N);
